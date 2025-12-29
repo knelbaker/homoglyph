@@ -44,13 +44,7 @@ def discover():
     # Normalize for Cosine Similarity (optional but good for embeddings)
     embeddings = F.normalize(embeddings, p=2, dim=1)
 
-    print(f"Computing similarity matrix for {len(filenames)} images...")
-    # Similarity matrix: (N, N)
-    # This might be large if N is huge. 
-    # If N=1000, 1000x1000 is small. If N=100k, we might need a better approach (FAISS).
-    # Assuming < 10k images for now.
-    
-    sim_matrix = torch.mm(embeddings, embeddings.t())
+
     
     # Find high similarities off-diagonal
     # We want to find pairs (i, j) where i != j and char(i) != char(j)
@@ -65,49 +59,94 @@ def discover():
 
     chars = [get_char_from_filename(f) for f in filenames]
     
-    results = []
+
     
-    # Optimized search using PyTorch operations
-    print("Finding pairs...")
+    # Optimized search using PyTorch operations with batching to avoid OOM
+    print(f"Finding pairs for {len(filenames)} images...")
     threshold = 0.95
-    
-    # Mask diagonal and lower triangle to avoid duplicates and self-matches
-    mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()
-    
-    # Filter by threshold
-    # We want sim_matrix > threshold AND mask
-    # To save memory, we can iterate in chunks or just try to find indices directly.
-    # Since we are on GPU/result is on GPU, let's keep it there.
-    
-    # Find indices where similarity > threshold
-    # (This returns indices on the device)
-    # We use a slightly higher threshold to reduce output if too many, but let's stick to 0.95
-    pairs = torch.nonzero((sim_matrix > threshold) & mask, as_tuple=False)
-    
-    print(f"Processing {len(pairs)} pairs...")
-    
     results = []
     
-    # Move chars/filenames to a lookup that is fast
-    # (Already lists)
+    # Process in chunks
+    chunk_size = 1000
+    N = len(embeddings)
     
-    # Convert pairs to CPU list for iteration (much smaller than N*N)
-    pairs_cpu = pairs.cpu().numpy()
-    
-    for i, j in pairs_cpu:
-        score = sim_matrix[i, j].item()
-        char_i = chars[i]
-        char_j = chars[j]
+    for i_start in range(0, N, chunk_size):
+        i_end = min(i_start + chunk_size, N)
         
-        if score > threshold: # Double check (redundant but safe)
-            if char_i != char_j:
-                 results.append({
-                    "char1": char_i,
-                    "file1": filenames[i],
-                    "char2": char_j,
-                    "file2": filenames[j],
-                    "score": score
-                })
+        # Current chunk of queries: (chunk, Latent)
+        queries = embeddings[i_start:i_end]
+        
+        # Similarity for this chunk: (chunk, N)
+        # sim[k, j] is similarity between query[k] and embedding[j]
+        # where query[k] corresponds to global index i_start + k
+        chunk_sim = torch.mm(queries, embeddings.t())
+        
+        # We only care about j > i (upper triangle)
+        # Create a mask for valid j indices
+        
+        # Global indices for rows in this chunk: [i_start, ..., i_end-1]
+        # We want j > i.
+        
+        # Let's find indices where sim > threshold
+        # items are (k, j) relative to chunk
+        matches = torch.nonzero(chunk_sim > threshold, as_tuple=False)
+        
+
+        
+        # Convert to CPU for explicit logic (vectorized filtering above was insufficient)
+        matches = matches.cpu().numpy()
+        
+        # 1. Group matches by query index k
+        from collections import defaultdict
+        matches_per_k = defaultdict(list)
+        for k, j in matches:
+            matches_per_k[k].append(j)
+            
+        # 2. Iterate and filter
+        for k, j_indices in matches_per_k.items():
+            global_i = i_start + k
+            
+            # Heuristic: If one image matches > 5 distinct characters, it's garbage/tofu.
+            # (e.g. 'l' matches '1', 'I', '|' -> 3 chars. Safe.
+            #  Tofu matches 'a', 'b', ... 'z' -> 26 chars. Filtered.)
+            
+            matched_chars = set()
+            valid_pairs = []
+            
+            # Optimization: check length first. If len(j_indices) > 500, it's almost certainly Tofu.
+            # (Unless we have > 500 fonts installed with identical 'l' and '1', which is possible but unlikely to be *exact* matches)
+            if len(j_indices) > 500:
+                continue
+            
+            for j in j_indices:
+                c_j = chars[j]
+                matched_chars.add(c_j)
+                valid_pairs.append(j)
+                
+            if len(matched_chars) > 5:
+                continue
+
+            # If passed, add to results
+            for j in valid_pairs:
+                if j > global_i: # enforce upper triangle
+                    score = chunk_sim[k, j].item()
+                    char_i = chars[global_i]
+                    char_j = chars[j]
+                
+                    if char_i != char_j:
+                         results.append({
+                            "char1": char_i,
+                            "file1": filenames[global_i],
+                            "char2": char_j,
+                            "file2": filenames[j],
+                            "score": score
+                        })
+        
+
+
+        if i_start % 5000 == 0:
+            print(f"Processed up to index {i_start}/{N}, found {len(results)} pairs so far...")
+
 
     # Sort by score descending
     results.sort(key=lambda x: x["score"], reverse=True)
