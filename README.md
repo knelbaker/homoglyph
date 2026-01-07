@@ -67,4 +67,4 @@ python3 discover.py
 
 ## Future Work
 
-Future work in this project would likely include using a larger dataset (more fonts) to gather more data on homoglyphs.
+Future work in this project would likely include using a larger dataset (more fonts) to gather more data on homoglyphs or to apply this to other alphabets like the Chinese and Cyrillic alphabets.
